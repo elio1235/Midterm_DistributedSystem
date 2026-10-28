@@ -1,0 +1,77 @@
+services:
+  metadata:
+    build: ./metadata
+    container_name: metadata
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+
+  storage-node-1:
+    build: ./storage_node
+    container_name: storage-node-1
+    environment:
+      NODE_ID: node-1
+      NODE_URL: http://storage-node-1:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node1-data:/data
+    ports:
+      - "8001:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-2:
+    build: ./storage_node
+    container_name: storage-node-2
+    environment:
+      NODE_ID: node-2
+      NODE_URL: http://storage-node-2:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node2-data:/data
+    ports:
+      - "8002:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-3:
+    build: ./storage_node
+    container_name: storage-node-3
+    environment:
+      NODE_ID: node-3
+      NODE_URL: http://storage-node-3:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node3-data:/data
+    ports:
+      - "8003:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-4:
+    build: ./storage_node
+    container_name: storage-node-4
+    environment:
+      NODE_ID: node-4
+      NODE_URL: http://storage-node-4:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node4-data:/data
+    ports:
+      - "8004:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
