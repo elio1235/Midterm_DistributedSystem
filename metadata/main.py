@@ -1,5 +1,5 @@
-import os
 import re
+import threading
 from collections import Counter
 from contextlib import asynccontextmanager
 
@@ -9,19 +9,18 @@ from psycopg2.extras import Json
 from pydantic import BaseModel
 
 import db
-from common.ring import HashRing
-
-HEARTBEAT_TIMEOUT = float(os.getenv("HEARTBEAT_TIMEOUT", "10"))
-REPLICATION_FACTOR = int(os.getenv("REPLICATION_FACTOR", "3"))
-VNODES = int(os.getenv("VNODES", "128"))
+import repair
+from cluster import HEARTBEAT_TIMEOUT, REPLICATION_FACTOR, load_ring, node_infos
 
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,63}$")
+MAX_SHARDS = 32
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    repair.start_background()
     yield
 
 
@@ -37,7 +36,12 @@ class Heartbeat(BaseModel):
 
 
 class BucketRequest(BaseModel):
-    redundancy: str = "replication"
+    redundancy: str = "replication"     # "replication" or "erasure"
+    replicas: int = 3                   # N
+    write_quorum: int = 2               # W
+    read_quorum: int = 2                # R   (W + R must be greater than N)
+    ec_k: int = 4                       # data shards
+    ec_m: int = 2                       # parity shards
 
 
 class ChunkRef(BaseModel):
@@ -46,13 +50,23 @@ class ChunkRef(BaseModel):
 
 
 class PlanRequest(BaseModel):
+    bucket: str | None = None
     chunks: list[ChunkRef]
+
+
+class ShardInfo(BaseModel):
+    i: int          # shard number: 0..k-1 data, k..k+m-1 parity
+    hash: str       # SHA-256 of the stored shard (= its name on the node)
+    node: str
+    size: int
 
 
 class UploadedChunk(BaseModel):
     hash: str
     size: int
-    nodes: list[str]
+    scheme: str = "replication"
+    nodes: list[str] = []               # replication: nodes that confirmed the write
+    shards: list[ShardInfo] = []        # erasure coding: shards that were stored
 
 
 class CommitRequest(BaseModel):
@@ -61,7 +75,7 @@ class CommitRequest(BaseModel):
     size: int
     chunking: str = "fixed"
     tags: dict[str, str] = {}
-    chunk_hashes: list[str]            # ordered list of chunk hashes of the object
+    chunk_hashes: list[str]             # ordered list of chunk hashes of the object
     uploaded: list[UploadedChunk] = []  # chunks the client really sent to the nodes
 
 
@@ -71,40 +85,18 @@ def check_hash(h):
         raise HTTPException(400, f"invalid chunk hash: {h}")
 
 
-_ring_cache = {"members": None, "ring": None}
+def get_bucket(cur, name):
+    cur.execute("SELECT * FROM buckets WHERE name = %s", (name,))
+    return cur.fetchone()
 
 
-def load_ring():
-    """Return (ring, urls) built from the nodes that are in the ring."""
-    with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute("SELECT node_id, url FROM nodes WHERE in_ring ORDER BY node_id")
-        rows = cur.fetchall()
-    members = tuple(r["node_id"] for r in rows)
-    if _ring_cache["members"] != members:
-        _ring_cache["ring"] = HashRing(members, vnodes=VNODES)
-        _ring_cache["members"] = members
-    return _ring_cache["ring"], {r["node_id"]: r["url"] for r in rows}
-
-
-def node_infos(node_ids):
-    """node_id -> {node_id, url, status} for the given ids."""
-    if not node_ids:
-        return {}
-    with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute(
-            "SELECT node_id, url, EXTRACT(EPOCH FROM (now() - last_seen))::float AS age "
-            "FROM nodes WHERE node_id = ANY(%s)",
-            (list(node_ids),),
-        )
-        rows = cur.fetchall()
-    return {
-        r["node_id"]: {
-            "node_id": r["node_id"],
-            "url": r["url"],
-            "status": "alive" if r["age"] <= HEARTBEAT_TIMEOUT else "failed",
-        }
-        for r in rows
-    }
+def bucket_config(b):
+    """The redundancy settings of a bucket as a small dictionary."""
+    if b["redundancy"] == "erasure":
+        return {"scheme": "erasure", "k": b["ec_k"], "m": b["ec_m"], "want": b["ec_k"] + b["ec_m"],
+                "min_ok": b["ec_k"] + 1}
+    return {"scheme": "replication", "want": b["replicas"], "min_ok": b["write_quorum"],
+            "write_quorum": b["write_quorum"], "read_quorum": b["read_quorum"]}
 
 
 # ------------------------------------------------------------------ health, heartbeat, nodes
@@ -118,11 +110,11 @@ def heartbeat(hb: Heartbeat):
     with db.get_conn() as conn, db.cursor(conn) as cur:
         cur.execute(
             """
-            INSERT INTO nodes (node_id, url, free_bytes, chunk_count, last_seen)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO nodes (node_id, url, free_bytes, chunk_count, last_seen, state)
+            VALUES (%s, %s, %s, %s, now(), 'alive')
             ON CONFLICT (node_id) DO UPDATE
               SET url = EXCLUDED.url, free_bytes = EXCLUDED.free_bytes,
-                  chunk_count = EXCLUDED.chunk_count, last_seen = now()
+                  chunk_count = EXCLUDED.chunk_count, last_seen = now(), state = 'alive', failed_at = NULL
             """,
             (hb.node_id, hb.url, hb.free_bytes, hb.chunk_count),
         )
@@ -133,7 +125,7 @@ def heartbeat(hb: Heartbeat):
 def list_nodes():
     with db.get_conn() as conn, db.cursor(conn) as cur:
         cur.execute(
-            "SELECT node_id, url, free_bytes, chunk_count, in_ring, "
+            "SELECT node_id, url, free_bytes, chunk_count, in_ring, state, failed_at, "
             "EXTRACT(EPOCH FROM (now() - last_seen))::float AS age FROM nodes ORDER BY node_id"
         )
         rows = cur.fetchall()
@@ -146,6 +138,8 @@ def list_nodes():
             "in_ring": r["in_ring"],
             "seconds_since_heartbeat": round(r["age"], 1),
             "status": "alive" if r["age"] <= HEARTBEAT_TIMEOUT else "failed",
+            "state": r["state"],            # 'failed' once the failure detector has marked the node (repair is triggered then)
+            "failed_at": r["failed_at"],
         }
         for r in rows
     ]
@@ -164,7 +158,7 @@ def get_ring():
 
 
 @app.get("/ring/placement/{chunk_hash}")
-def placement(chunk_hash: str, n: int = Query(REPLICATION_FACTOR, ge=1, le=16)):
+def placement(chunk_hash: str, n: int = Query(REPLICATION_FACTOR, ge=1, le=MAX_SHARDS)):
     check_hash(chunk_hash)
     ring, urls = load_ring()
     ids = ring.get_nodes(chunk_hash, n)
@@ -194,45 +188,69 @@ def remove_node_from_ring(node_id: str):
 def create_bucket(name: str, req: BucketRequest = BucketRequest()):
     if not NAME_RE.match(name):
         raise HTTPException(400, "bucket name: 1-63 characters, letters, digits, . _ -")
-    if req.redundancy not in ("replication", "erasure"):
+    if req.redundancy == "replication":
+        n, w, r = req.replicas, req.write_quorum, req.read_quorum
+        if not (1 <= n <= 16 and 1 <= w <= n and 1 <= r <= n):
+            raise HTTPException(400, "need 1 <= N <= 16, 1 <= W <= N and 1 <= R <= N")
+        if w + r <= n:
+            raise HTTPException(400, f"quorum rule broken: W + R must be greater than N (W={w}, R={r}, N={n})")
+    elif req.redundancy == "erasure":
+        if not (1 <= req.ec_k and 1 <= req.ec_m and req.ec_k + req.ec_m <= MAX_SHARDS):
+            raise HTTPException(400, f"need k >= 1, m >= 1 and k + m <= {MAX_SHARDS}")
+    else:
         raise HTTPException(400, "redundancy must be 'replication' or 'erasure'")
     with db.get_conn() as conn, db.cursor(conn) as cur:
         cur.execute(
-            "INSERT INTO buckets (name, redundancy) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING",
-            (name, req.redundancy),
+            "INSERT INTO buckets (name, redundancy, replicas, write_quorum, read_quorum, ec_k, ec_m) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING",
+            (name, req.redundancy, req.replicas, req.write_quorum, req.read_quorum, req.ec_k, req.ec_m),
         )
         created = cur.rowcount == 1
-    return {"name": name, "redundancy": req.redundancy, "created": created}
+        b = get_bucket(cur, name)
+    return {"name": name, "created": created, **bucket_config(b)}
 
 
 @app.get("/buckets")
 def list_buckets():
     with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute("SELECT name, redundancy, created_at FROM buckets ORDER BY name")
-        return cur.fetchall()
+        cur.execute("SELECT * FROM buckets ORDER BY name")
+        return [{"name": b["name"], "created_at": b["created_at"], **bucket_config(b)} for b in cur.fetchall()]
 
 
 # ------------------------------------------------------------------ chunks: plan (dedup check + placement)
 @app.post("/chunks/plan")
 def plan_chunks(req: PlanRequest):
-    """For each chunk: does it already exist (dedup hit)? If not, which nodes should store it?"""
+    """For each chunk: does it already exist (dedup hit)? If not, which nodes should store it, and how?"""
     hashes = [c.hash for c in req.chunks]
     for h in hashes:
         check_hash(h)
     ring, urls = load_ring()
     with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute("SELECT hash, nodes FROM chunks WHERE hash = ANY(%s) AND ref_count > 0", (hashes,))
-        existing = {r["hash"]: r["nodes"] for r in cur.fetchall()}
-    stored_ids = {n for nodes in existing.values() for n in nodes}
-    infos = node_infos(stored_ids)
+        if req.bucket is None:
+            cfg = {"scheme": "replication", "want": REPLICATION_FACTOR, "min_ok": 2}
+        else:
+            b = get_bucket(cur, req.bucket)
+            if not b:
+                raise HTTPException(404, "bucket not found")
+            cfg = bucket_config(b)
+        cur.execute("SELECT hash, scheme, nodes FROM chunks WHERE hash = ANY(%s) AND ref_count > 0", (hashes,))
+        existing = {r["hash"]: r for r in cur.fetchall()}
+    new_hashes = [h for h in hashes if h not in existing]
+    if new_hashes and len(ring) < cfg["min_ok"]:
+        raise HTTPException(503, f"only {len(ring)} alive nodes, but {cfg['min_ok']} are needed to store a chunk")
+    infos = node_infos({n for r in existing.values() for n in r["nodes"]})
     result = []
     for h in hashes:
         if h in existing:
-            targets = [infos.get(n, {"node_id": n, "url": "", "status": "unknown"}) for n in existing[h]]
-            result.append({"hash": h, "exists": True, "targets": targets})
+            targets = [infos.get(n, {"node_id": n, "url": "", "status": "unknown"}) for n in existing[h]["nodes"]]
+            result.append({"hash": h, "exists": True, "scheme": existing[h]["scheme"], "targets": targets})
         else:
-            ids = ring.get_nodes(h, REPLICATION_FACTOR)
-            result.append({"hash": h, "exists": False, "targets": [{"node_id": i, "url": urls[i]} for i in ids]})
+            ids = ring.get_nodes(h, cfg["want"])
+            result.append({
+                "hash": h, "exists": False, "scheme": cfg["scheme"], "want": cfg["want"], "min_ok": cfg["min_ok"],
+                "k": cfg.get("k"), "m": cfg.get("m"),
+                "targets": [{"node_id": i, "url": urls[i]} for i in ids],
+            })
     return {"chunks": result}
 
 
@@ -240,7 +258,9 @@ def plan_chunks(req: PlanRequest):
 def chunk_info(chunk_hash: str):
     check_hash(chunk_hash)
     with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute("SELECT hash, size, ref_count, nodes, created_at FROM chunks WHERE hash = %s", (chunk_hash,))
+        cur.execute(
+            "SELECT hash, size, ref_count, scheme, want, ec_k, ec_m, nodes, shards, stored_bytes, created_at "
+            "FROM chunks WHERE hash = %s", (chunk_hash,))
         row = cur.fetchone()
     if not row:
         raise HTTPException(404, "chunk not found")
@@ -263,20 +283,38 @@ def commit_object(req: CommitRequest):
     counts = Counter(req.chunk_hashes)
     uploaded = {u.hash: u for u in req.uploaded}
     with db.get_conn() as conn, db.cursor(conn) as cur:
-        cur.execute("SELECT 1 FROM buckets WHERE name = %s", (req.bucket,))
-        if not cur.fetchone():
+        b = get_bucket(cur, req.bucket)
+        if not b:
             raise HTTPException(404, "bucket not found")
+        cfg = bucket_config(b)
 
         missing = []
         for h, count in counts.items():
             if h in uploaded:
                 u = uploaded[h]
+                if u.scheme != cfg["scheme"]:
+                    raise HTTPException(400, f"bucket uses {cfg['scheme']} but chunk {h[:12]} was sent as {u.scheme}")
+                if cfg["scheme"] == "replication":
+                    nodes = sorted(set(u.nodes))
+                    if len(nodes) < cfg["min_ok"]:
+                        raise HTTPException(400, f"write quorum not reached for chunk {h[:12]}: {len(nodes)} of W={cfg['min_ok']}")
+                    shards, ec_k, ec_m = [], None, None
+                    stored = u.size * len(nodes)
+                else:
+                    idx = {s.i for s in u.shards}
+                    if len(idx) != len(u.shards) or not idx <= set(range(cfg["want"])) or len(idx) < cfg["min_ok"]:
+                        raise HTTPException(400, f"write quorum not reached for chunk {h[:12]}: {len(idx)} shards, need {cfg['min_ok']}")
+                    shards = [s.model_dump() for s in sorted(u.shards, key=lambda s: s.i)]
+                    nodes = sorted({s["node"] for s in shards})
+                    ec_k, ec_m = cfg["k"], cfg["m"]
+                    stored = sum(s["size"] for s in shards)
                 cur.execute(
                     """
-                    INSERT INTO chunks (hash, size, ref_count, nodes) VALUES (%s, %s, %s, %s)
+                    INSERT INTO chunks (hash, size, ref_count, nodes, scheme, want, ec_k, ec_m, shards, stored_bytes)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (hash) DO UPDATE SET ref_count = chunks.ref_count + EXCLUDED.ref_count
                     """,
-                    (h, u.size, count, u.nodes),
+                    (h, u.size, count, nodes, cfg["scheme"], cfg["want"], ec_k, ec_m, Json(shards), stored),
                 )
             else:
                 # deduplicated chunk: it must already exist, we only add references
@@ -324,14 +362,30 @@ def get_object(bucket: str, key: str, version: int | None = None):
         obj = cur.fetchone()
         if not obj:
             raise HTTPException(404, "object not found")
-        cur.execute("SELECT hash, size, nodes FROM chunks WHERE hash = ANY(%s)", (obj["chunk_hashes"],))
+        b = get_bucket(cur, bucket)
+        cur.execute(
+            "SELECT hash, size, scheme, want, ec_k, ec_m, nodes, shards FROM chunks WHERE hash = ANY(%s)",
+            (obj["chunk_hashes"],),
+        )
         chunk_rows = {r["hash"]: r for r in cur.fetchall()}
     infos = node_infos({n for r in chunk_rows.values() for n in r["nodes"]})
+
+    def info(n):
+        return infos.get(n, {"node_id": n, "url": "", "status": "unknown"})
+
     chunks = []
     for h in obj["chunk_hashes"]:
         row = chunk_rows.get(h)
-        nodes = [infos.get(n, {"node_id": n, "url": "", "status": "unknown"}) for n in row["nodes"]] if row else []
-        chunks.append({"hash": h, "size": row["size"] if row else None, "nodes": nodes})
+        if not row:
+            chunks.append({"hash": h, "size": None, "scheme": None, "nodes": [], "shards": []})
+            continue
+        chunks.append({
+            "hash": h, "size": row["size"], "scheme": row["scheme"], "want": row["want"],
+            "k": row["ec_k"], "m": row["ec_m"],
+            "nodes": [info(n) for n in row["nodes"]],
+            "shards": [{"i": s["i"], "hash": s["hash"], "size": s["size"], "node_id": s["node"],
+                        "url": info(s["node"])["url"], "status": info(s["node"])["status"]} for s in row["shards"]],
+        })
     return {
         "bucket": obj["bucket"],
         "key": obj["key"],
@@ -340,6 +394,7 @@ def get_object(bucket: str, key: str, version: int | None = None):
         "chunking": obj["chunking"],
         "tags": obj["tags"],
         "created_at": obj["created_at"],
+        "redundancy": bucket_config(b),
         "chunks": chunks,
     }
 
@@ -355,26 +410,28 @@ def delete_object(bucket: str, key: str):
         counts = Counter(h for r in rows for h in r["chunk_hashes"])
         cur.execute("DELETE FROM objects WHERE bucket = %s AND key = %s", (bucket, key))
 
-        freed = []   # (hash, nodes) of chunks that nobody references anymore
+        freed = []   # (hash, [(node, blob_hash)]) of chunks that nobody references anymore
         for h, count in counts.items():
             cur.execute(
-                "UPDATE chunks SET ref_count = ref_count - %s WHERE hash = %s RETURNING ref_count, nodes", (count, h)
+                "UPDATE chunks SET ref_count = ref_count - %s WHERE hash = %s "
+                "RETURNING ref_count, nodes, scheme, shards", (count, h)
             )
             row = cur.fetchone()
             if row and row["ref_count"] <= 0:
-                freed.append((h, row["nodes"]))
+                row["hash"] = h
+                freed.append((h, repair.blob_locations(row)))
         if freed:
             cur.execute("DELETE FROM chunks WHERE hash = ANY(%s)", ([h for h, _ in freed],))
 
-    # physically delete the freed chunks from the storage nodes (best effort)
-    infos = node_infos({n for _, nodes in freed for n in nodes})
+    # physically delete the freed chunks (or erasure shards) from the storage nodes (best effort)
+    infos = node_infos({n for _, blobs in freed for n, _ in blobs})
     node_errors = 0
     with httpx.Client(timeout=10) as client:
-        for h, nodes in freed:
-            for n in nodes:
-                info = infos.get(n)
+        for h, blobs in freed:
+            for node, blob_hash in blobs:
+                info = infos.get(node)
                 try:
-                    r = client.delete(f"{info['url']}/chunks/{h}")
+                    r = client.delete(f"{info['url']}/chunks/{blob_hash}")
                     if r.status_code not in (200, 404):
                         node_errors += 1
                 except Exception:
@@ -392,6 +449,55 @@ def delete_object(bucket: str, key: str):
     }
 
 
+# ------------------------------------------------------------------ repair and scrubbing
+@app.post("/repair/run")
+def run_repair(wait: bool = True, if_needed: bool = False):
+    """Start a repair job now (it also runs by itself when a node fails).
+    With if_needed=true no job is created when every chunk is complete."""
+    if if_needed:
+        dead = [n for n, i in node_infos().items() if i["status"] != "alive"]
+        if not repair.chunks_needing_repair(dead):
+            return {"skipped": True, "message": "nothing to repair"}
+    job_id = repair.trigger_repair("manual", None, wait=wait)
+    return get_repair_job(job_id)
+
+
+@app.get("/repair/jobs")
+def list_repair_jobs(limit: int = Query(10, ge=1, le=200)):
+    with db.get_conn() as conn, db.cursor(conn) as cur:
+        cur.execute("SELECT * FROM repair_jobs ORDER BY id DESC LIMIT %s", (limit,))
+        return cur.fetchall()
+
+
+@app.get("/repair/jobs/{job_id}")
+def get_repair_job(job_id: int):
+    with db.get_conn() as conn, db.cursor(conn) as cur:
+        cur.execute("SELECT * FROM repair_jobs WHERE id = %s", (job_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "repair job not found")
+    return row
+
+
+@app.post("/scrub/run")
+def run_scrub(orphans: bool = True, grace: float | None = None, wait: bool = True):
+    """Run the scrubber now. grace = minimum age (seconds) of a file before it can be deleted as an orphan."""
+    if not wait:
+        threading.Thread(target=repair.scrub_once, args=("manual", orphans, grace), daemon=True).start()
+        return {"started": True}
+    run_id = repair.scrub_once("manual", orphans, grace)
+    with db.get_conn() as conn, db.cursor(conn) as cur:
+        cur.execute("SELECT * FROM scrub_runs WHERE id = %s", (run_id,))
+        return cur.fetchone()
+
+
+@app.get("/scrub/runs")
+def list_scrub_runs(limit: int = Query(10, ge=1, le=200)):
+    with db.get_conn() as conn, db.cursor(conn) as cur:
+        cur.execute("SELECT * FROM scrub_runs ORDER BY id DESC LIMIT %s", (limit,))
+        return cur.fetchall()
+
+
 # ------------------------------------------------------------------ statistics
 @app.get("/stats/dedup")
 def dedup_stats():
@@ -399,17 +505,27 @@ def dedup_stats():
         cur.execute("SELECT COUNT(*) AS versions, COALESCE(SUM(size), 0) AS logical FROM objects")
         o = cur.fetchone()
         cur.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS unique_bytes, "
-            "COALESCE(SUM(size::bigint * cardinality(nodes)), 0) AS stored_bytes FROM chunks"
+            "SELECT scheme, COUNT(*) AS chunks, COALESCE(SUM(size), 0) AS unique_bytes, "
+            "COALESCE(SUM(stored_bytes), 0) AS stored_bytes FROM chunks GROUP BY scheme ORDER BY scheme"
         )
-        c = cur.fetchone()
-    logical, unique = int(o["logical"]), int(c["unique_bytes"])
+        by_scheme = cur.fetchall()
+    logical = int(o["logical"])
+    unique = sum(int(s["unique_bytes"]) for s in by_scheme)
+    stored = sum(int(s["stored_bytes"]) for s in by_scheme)
     return {
         "object_versions": o["versions"],
         "logical_bytes": logical,
-        "unique_chunks": c["n"],
+        "unique_chunks": sum(s["chunks"] for s in by_scheme),
         "unique_bytes": unique,
-        "stored_bytes_with_replicas": int(c["stored_bytes"]),
+        "stored_bytes": stored,
+        "stored_bytes_with_replicas": stored,
+        "storage_overhead": round(stored / unique, 3) if unique else None,
         "dedup_ratio": round(logical / unique, 2) if unique else None,
         "space_saved_percent": round((1 - unique / logical) * 100, 1) if logical else 0.0,
+        "by_scheme": [
+            {"scheme": s["scheme"], "chunks": s["chunks"], "unique_bytes": int(s["unique_bytes"]),
+             "stored_bytes": int(s["stored_bytes"]),
+             "storage_overhead": round(int(s["stored_bytes"]) / int(s["unique_bytes"]), 3) if s["unique_bytes"] else None}
+            for s in by_scheme
+        ],
     }

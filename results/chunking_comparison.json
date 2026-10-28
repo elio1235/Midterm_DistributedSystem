@@ -8,7 +8,7 @@
       "avg_kb": 1024,
       "max_kb": 1024,
       "seconds": 0.02,
-      "mb_per_s": 810.0,
+      "mb_per_s": 913.3,
       "changes": {
         "100 bytes inserted at the start": {
           "chunks": 17,
@@ -29,8 +29,8 @@
       "min_kb": 1,
       "avg_kb": 910,
       "max_kb": 1911,
-      "seconds": 1.9,
-      "mb_per_s": 8.4,
+      "seconds": 1.71,
+      "mb_per_s": 9.4,
       "changes": {
         "100 bytes inserted at the start": {
           "chunks": 18,

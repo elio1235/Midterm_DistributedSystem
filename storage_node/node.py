@@ -3,12 +3,14 @@ import hashlib
 import os
 import re
 import shutil
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
 
 NODE_ID = os.getenv("NODE_ID", "node-1")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -35,8 +37,14 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def iter_chunk_files():
+    for p in DATA_DIR.glob("*/*"):
+        if p.is_file() and HASH_RE.match(p.name):
+            yield p
+
+
 def count_chunks() -> int:
-    return sum(1 for p in DATA_DIR.glob("*/*") if p.is_file() and HASH_RE.match(p.name))
+    return sum(1 for _ in iter_chunk_files())
 
 
 async def heartbeat_loop() -> None:
@@ -125,6 +133,50 @@ def delete_chunk(chunk_hash: str):
         raise HTTPException(status_code=404, detail="chunk not found")
     path.unlink()
     return {"node_id": NODE_ID, "chunk_hash": chunk_hash, "status": "deleted"}
+
+
+# ---------------------------------------------------------------- Step 3: scrubbing support
+class VerifyRequest(BaseModel):
+    hashes: list[str]
+
+
+@app.post("/verify")
+def verify_chunks(req: VerifyRequest):
+    """Re-read the given chunks from the disk and check their SHA-256 (the scrubber uses this).
+    The data never leaves the node: only the list of bad chunks is returned."""
+    corrupt, missing, bytes_read = [], [], 0
+    for h in req.hashes:
+        validate_hash(h)
+        path = chunk_path(h)
+        if not path.is_file():
+            missing.append(h)
+            continue
+        data = path.read_bytes()
+        bytes_read += len(data)
+        if sha256_hex(data) != h:
+            corrupt.append(h)
+    return {"node_id": NODE_ID, "checked": len(req.hashes), "bytes_read": bytes_read, "corrupt": corrupt, "missing": missing}
+
+
+@app.get("/chunks")
+def list_chunks():
+    """All chunk files on this node, with their size and age (used to find orphan files)."""
+    now = time.time()
+    items = []
+    for p in iter_chunk_files():
+        st = p.stat()
+        items.append({"hash": p.name, "size": st.st_size, "age_seconds": round(now - st.st_mtime, 1)})
+    return {"node_id": NODE_ID, "count": len(items), "chunks": items}
+
+
+@app.get("/stats")
+def stats():
+    """Real number of files and bytes on the disk of this node (used by the benchmarks)."""
+    count, used = 0, 0
+    for p in iter_chunk_files():
+        count += 1
+        used += p.stat().st_size
+    return {"node_id": NODE_ID, "chunk_count": count, "used_bytes": used}
 
 
 @app.get("/health")

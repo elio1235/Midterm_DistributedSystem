@@ -9,6 +9,10 @@ services:
       REPLICATION_FACTOR: "3"
       VNODES: "128"
       HEARTBEAT_TIMEOUT: "10"
+      DETECT_INTERVAL: "2"
+      REPAIR_SWEEP_INTERVAL: "30"
+      SCRUB_INTERVAL: "120"
+      ORPHAN_GRACE: "3600"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -79,8 +83,59 @@ services:
       - metadata
     restart: unless-stopped
 
+  storage-node-5:
+    build: ./storage_node
+    container_name: storage-node-5
+    environment:
+      NODE_ID: node-5
+      NODE_URL: http://storage-node-5:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node5-data:/data
+    ports:
+      - "8005:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-6:
+    build: ./storage_node
+    container_name: storage-node-6
+    environment:
+      NODE_ID: node-6
+      NODE_URL: http://storage-node-6:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node6-data:/data
+    ports:
+      - "8006:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
+  storage-node-7:
+    build: ./storage_node
+    container_name: storage-node-7
+    environment:
+      NODE_ID: node-7
+      NODE_URL: http://storage-node-7:8000
+      METADATA_URL: http://metadata:9000
+      HEARTBEAT_INTERVAL: "3"
+    volumes:
+      - node7-data:/data
+    ports:
+      - "8007:8000"
+    depends_on:
+      - metadata
+    restart: unless-stopped
+
 volumes:
   node1-data:
   node2-data:
   node3-data:
   node4-data:
+  node5-data:
+  node6-data:
+  node7-data:
