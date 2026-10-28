@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 from psycopg2.extras import Json
 from pydantic import BaseModel
 
+import api_extra
 import db
 import repair
 from cluster import HEARTBEAT_TIMEOUT, REPLICATION_FACTOR, load_ring, node_infos
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Metadata and Placement Service", lifespan=lifespan)
+app.include_router(api_extra.router)
 
 
 # ------------------------------------------------------------------ models
