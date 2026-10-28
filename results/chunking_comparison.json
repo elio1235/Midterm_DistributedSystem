@@ -1,0 +1,50 @@
+{
+  "file_mb": 16,
+  "target_chunk_kb": 1024,
+  "methods": {
+    "fixed": {
+      "chunks": 16,
+      "min_kb": 1024,
+      "avg_kb": 1024,
+      "max_kb": 1024,
+      "seconds": 0.02,
+      "mb_per_s": 810.0,
+      "changes": {
+        "100 bytes inserted at the start": {
+          "chunks": 17,
+          "reused": 0,
+          "reused_percent": 0.0,
+          "new_mb_to_store": 16.0
+        },
+        "100 bytes overwritten in the middle": {
+          "chunks": 16,
+          "reused": 15,
+          "reused_percent": 93.8,
+          "new_mb_to_store": 1.0
+        }
+      }
+    },
+    "cdc": {
+      "chunks": 18,
+      "min_kb": 1,
+      "avg_kb": 910,
+      "max_kb": 1911,
+      "seconds": 1.9,
+      "mb_per_s": 8.4,
+      "changes": {
+        "100 bytes inserted at the start": {
+          "chunks": 18,
+          "reused": 17,
+          "reused_percent": 94.4,
+          "new_mb_to_store": 1.21
+        },
+        "100 bytes overwritten in the middle": {
+          "chunks": 18,
+          "reused": 17,
+          "reused_percent": 94.4,
+          "new_mb_to_store": 1.65
+        }
+      }
+    }
+  }
+}

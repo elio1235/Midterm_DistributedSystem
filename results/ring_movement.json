@@ -1,0 +1,51 @@
+{
+  "chunks": 100000,
+  "replicas": 3,
+  "vnodes": 128,
+  "balance": [
+    {
+      "vnodes": 1,
+      "min": 17.5,
+      "max": 30.7,
+      "std": 5.82
+    },
+    {
+      "vnodes": 8,
+      "min": 14.9,
+      "max": 35.1,
+      "std": 7.55
+    },
+    {
+      "vnodes": 32,
+      "min": 20.5,
+      "max": 28.1,
+      "std": 2.81
+    },
+    {
+      "vnodes": 128,
+      "min": 23.9,
+      "max": 26.4,
+      "std": 0.94
+    },
+    {
+      "vnodes": 512,
+      "min": 23.1,
+      "max": 26.0,
+      "std": 1.13
+    }
+  ],
+  "movement": {
+    "add node-5 (4 -> 5 nodes)": {
+      "primary_moved_percent": 18.6,
+      "replica_copies_moved_percent": 20.4,
+      "modulo_primary_moved_percent": 80.3,
+      "ideal_percent": 20.0
+    },
+    "remove node-4 (4 -> 3 nodes)": {
+      "primary_moved_percent": 24.5,
+      "replica_copies_moved_percent": 25.5,
+      "modulo_primary_moved_percent": 75.0,
+      "ideal_percent": 25.0
+    }
+  }
+}

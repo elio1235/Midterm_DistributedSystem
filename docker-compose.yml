@@ -1,7 +1,16 @@
 services:
   metadata:
-    build: ./metadata
+    build:
+      context: .
+      dockerfile: metadata/Dockerfile
     container_name: metadata
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@host.docker.internal:5432/postgres
+      REPLICATION_FACTOR: "3"
+      VNODES: "128"
+      HEARTBEAT_TIMEOUT: "10"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "9000:9000"
     restart: unless-stopped
